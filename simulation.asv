@@ -1,0 +1,271 @@
+%% Clean up
+clc;
+close all;
+clear all;
+%% Initalize Simulation Parameters
+
+%Define 3x3 Identity Matrix
+I = [[1 0 0];[0 1 0];[0 0 1]];
+
+%Init Ground Frame
+groundFrame = frame;
+groundFrame = initFrame(groundFrame, [0 0 0].', I);
+
+%Define Beacon points in ground frame
+P = [1 0 0].';
+Q = [0 1 0].';
+R = [1 1 0].';
+
+%Add beacon points in ground frame
+groundFrame = groundFrame.addPoint(P);
+groundFrame = groundFrame.addPoint(Q);
+groundFrame = groundFrame.addPoint(R);
+
+%Init Trilateration Frame
+firstFrame = frame;
+
+%Define orientaiton as described in project document 
+phi = atan2(Q(2)-P(2),Q(1)-P(1));
+
+R1 = [[cos(phi) -sin(phi) 0 ]
+      [sin(phi) cos(phi) 0] 
+      [0 0 1]];
+
+%Define Trilat Frame 
+firstFrame = initFrame(firstFrame, P, R1);
+
+%Add points Q and R to Trilateration Frame
+firstFrame = firstFrame.addPointFromFrame(groundFrame,2);
+firstFrame = firstFrame.addPointFromFrame(groundFrame,3);
+
+%Init Block Orientation 
+RB = I;
+
+%Define origin of block
+O = [1 2 3].';
+
+%Init body frame
+bodyFrame = frame;
+bodyFrame = bodyFrame.initFrame(O,RB);
+
+%Define Block as a body using body frame 
+block = body;
+block = block.initBody(bodyFrame);
+
+%Block dimensions
+a = 1;
+b = 1;
+c = 1;
+
+%Define Block Particles
+A = [0 0 b].';
+B = [0 a b].';
+C = [c a b].';
+D = [c 0 b].';
+F = [0 a 0].';
+G = [c a 0].';
+H = [c 0 0].';
+
+%Add block particles 
+%Bottom particles of block
+block=block.addParticle(A);
+block=block.addParticle(B);
+block=block.addParticle(C);
+block=block.addParticle(D);
+
+%Corners we are tracking 
+block=block.addParticle(F);
+block=block.addParticle(G);
+block=block.addParticle(H);
+
+
+%% Simulate Motion
+w1 = [3.1415/2;0;0];
+w2 = [0;3.1415/2;0];
+w3 = [0;0;3.1415/2];
+v1 = [1;0;0];
+v2 = [0;1;0];
+v3 = [0;0;1];
+
+dt1 = 1;
+dt2 = 2;
+dt3 = 3;
+
+%Define a series of rotational speeds and associated durations
+ws = [[w1;v1;dt1] [w2;v2;dt2] [w3;v3;dt3]];
+
+%Init storage array for previous values to use for solving future values
+n = length(ws(1,:));
+Rs = zeros([3 3 n+1]);
+Rs(:,:,1) = RB(:,:);
+Os = zeros([3,1,n+1]);
+Os(:,:,1) = O;
+
+%Execute rotations, estimate parameters
+for i = 1:length(ws(1,:))
+    dt = ws(4,i);
+    w = ws(1:3,i);
+    block.F = block.F.rotateAtAngularSpeed(w,dt);
+    block = block.translateBody(v1);
+    [R_est, O_est] = estimate(groundFrame,firstFrame,block,dt,Rs(:,:,i));
+    Rs(:,:,i+1) = R_est(:,:);
+    Os(:,:,1+i) = O_est;
+end
+
+
+%% Estimate Orientation and Origin Function
+%This function combines all functions into predicting the 
+function [R_best, O_est]=estimate(groundFrame,firstFrame,block,dt,R_last)
+
+    lengths = measureDistances(groundFrame,block);
+    
+    [F_est, G_est, H_est]  = estimateCorners(firstFrame,lengths);
+    
+    O_est = originFromCorners(F_est,G_est,H_est);
+    R_est_1 = rotationFromCorners(F_est,G_est,H_est);
+        
+    w_est = estimateGyro(block);
+    R_est_2 = rotationFromGyro(w_est,dt,R_last);
+    
+    R_best = procrustes(R_est_1,R_est_2);
+      
+    fig = displayResults(block.F.O,O_est,block.F.R,R_best);
+end
+
+%% Trilateration Helper Functions
+
+%Finds origin of block in ground frame using corners 
+function O = originFromCorners(F,G,H)
+O = F+H-G; %From the definition of these points
+end
+
+%Finds the orientation of the block using the corners 
+function R = rotationFromCorners(F,G,H)
+    
+    i = (G - F); 
+    i = i./sqrt(dot(i,i)); %Normalize vector
+    j = (G - H); %Normalize vector
+    j = j./sqrt(dot(j,j));
+    k = cross(i,j); %Since we are in a right handed coordinate system 
+
+    R = [i j k]; %Define coordinate transformation matrix
+end
+
+%Returns the estimated position of the corners in the ground frame
+%Takes input of trilateration frame and the distances 
+function [F, G, H] = estimateCorners(trilatFrame,lengths)
+    Q = trilatFrame.getPoint(1);
+    R = trilatFrame.getPoint(2);
+    A = Q(1);
+    B = R(1);
+    C = R(2);
+    
+    r = trilaterate(A,B,C, lengths(1,1),lengths(2,1), lengths(3,1));
+    F = trilatFrame.Tout*[r;1];
+    F = [F(1);F(2);F(3)];
+
+    r = trilaterate(A,B,C, lengths(1,2),lengths(2,2), lengths(3,2));
+    G = trilatFrame.Tout*[r;1];
+    G = [G(1);G(2);G(3)];
+
+    r = trilaterate(A,B,C, lengths(1,3),lengths(2,3), lengths(3,3));
+    H = trilatFrame.Tout*[r;1];
+    H = [H(1);H(2);H(3)];
+
+end
+
+%Measures the distances between the beacon points and the corner points 
+%Adds noise
+function  lengths = measureDistances(gF, block)
+   lengths = zeros(3);
+    for i = 1:3
+        for j = 1:3
+            lengths(i,j)=addNoise(distance(gF.getPoint(i),block.getPointOfParticle(4+j)));
+        end
+    end
+
+end
+%% Gyro Helper Functions 
+
+%Estimates angular velocity of the body
+%Adds noise
+function w = estimateGyro(body)
+    w = addNoise(body.F.w);
+end
+
+%Estimates current orientation using previous orientation, duration of
+%rotation and angular velocity
+function R_est = rotationFromGyro(w,dt,R)
+     W = [[0 -w(3) w(2)];
+          [w(3) 0 -w(1)];
+          [-w(2) w(1) 0]];
+     R_est=R*expm(W.*dt);   
+end
+%% Other Helper Functions
+%Add noise to input
+%Adds bias noise and random noise
+function n = addNoise(a)
+n = a*1+(0.001)*(rand-0.5)+0.001;
+end
+
+%Calculates distance between two points
+function d = distance(r1,r2)
+    d = sqrt(dot(r1-r2,r1-r2));
+end
+
+%Procrustes solution for orthogonal matricies
+%Uses Singular Value Decomposition 
+function R = procrustes(R1,R2)
+    Ravg = (R1+R2)./2;
+    [U,~,V]=svd(Ravg);
+    R=U*V';
+end
+
+%Printing results
+%This is matlab black magic
+function fig = displayResults(O,O_est,R,R_est)
+
+R=round(R,4);
+R_est=round(R_est,4);
+fig = figure;
+T1 = array2table(R,...
+    'VariableNames',{'i','j','k'});
+T2 = array2table(R_est,...
+    'VariableNames',{'i','j','k'});
+
+T3 = [mergevars(T1,T1.Properties.VariableNames,'NewVariableName','True','MergeAsTable',true),...
+    mergevars(T2,T2.Properties.VariableNames,'NewVariableName','Estimate','MergeAsTable',true)];
+
+T4 = array2table(O,...
+    'VariableNames',{' '});
+T5 = array2table(O_est,...
+    'VariableNames',{' '});
+
+T6 = [mergevars(T4,T4.Properties.VariableNames,'NewVariableName','True','MergeAsTable',true),...
+    mergevars(T5,T5.Properties.VariableNames,'NewVariableName','Estimate','MergeAsTable',true)];
+
+% Get the table in string form.
+ TString = evalc('disp(T3)');
+% Use TeX Markup for bold formatting and underscores.
+ TString = strrep(TString,'<strong>','\bf');
+ TString = strrep(TString,'</strong>','\rm');
+ TString = strrep(TString,'_','\_');
+% Get a fixed-width font.
+ FixedWidth = get(0,'FixedWidthFontName');
+% Output the table using the annotation command.
+ annotation(gcf,'Textbox','String',TString,'Interpreter','Tex',...
+     'FontName',FixedWidth,'Units','Normalized','Position',[0 0 1 0.5]);
+
+% Get the table in string form.
+TString = evalc('disp(T6)');
+% Use TeX Markup for bold formatting and underscores.
+TString = strrep(TString,'<strong>','\bf');
+TString = strrep(TString,'</strong>','\rm');
+TString = strrep(TString,'_','\_');
+% Get a fixed-width font.
+FixedWidth = get(0,'FixedWidthFontName');
+% Output the table using the annotation command.
+annotation(gcf,'Textbox','String',TString,'Interpreter','Tex',...
+    'FontName',FixedWidth,'Units','Normalized','Position',[0 0 1 1]);
+end
+
